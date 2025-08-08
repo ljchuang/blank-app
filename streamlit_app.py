@@ -40,13 +40,16 @@ def denoise_gaussian(img_bgr: np.ndarray, ksize: int, sigma: float) -> np.ndarra
     k = max(3, ksize | 1)
     return cv2.GaussianBlur(img_bgr, (k, k), sigmaX=sigma)
 
+
 def denoise_median(img_bgr: np.ndarray, ksize: int) -> np.ndarray:
     k = max(3, ksize | 1)
     return cv2.medianBlur(img_bgr, k)
 
+
 def denoise_bilateral(img_bgr: np.ndarray, d: int, sigma_color: float, sigma_space: float) -> np.ndarray:
     d = max(1, int(d))
     return cv2.bilateralFilter(img_bgr, d=d, sigmaColor=sigma_color, sigmaSpace=sigma_space)
+
 
 def denoise_nlm_colored(img_bgr: np.ndarray, h: float, hColor: float, template: int, search: int) -> np.ndarray:
     template = max(3, template | 1)
@@ -60,13 +63,16 @@ def denoise_nlm_colored(img_bgr: np.ndarray, h: float, hColor: float, template: 
 def to_gray(img_bgr: np.ndarray) -> np.ndarray:
     return cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
 
+
 def hist_equalize(gray: np.ndarray) -> np.ndarray:
     return cv2.equalizeHist(gray)
+
 
 def erode(gray: np.ndarray, ksize: int, iterations: int) -> np.ndarray:
     k = max(3, ksize | 1)
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k, k))
     return cv2.erode(gray, kernel, iterations=max(1, iterations))
+
 
 def binarize(gray: np.ndarray, mode: str, thresh: int, block_size: int, C: int) -> np.ndarray:
     if mode == "Otsu":
@@ -80,6 +86,7 @@ def binarize(gray: np.ndarray, mode: str, thresh: int, block_size: int, C: int) 
     else:
         _, bw = cv2.threshold(gray, thresh, 255, cv2.THRESH_BINARY)
     return bw
+
 
 def watershed_segment(img_bgr: np.ndarray, bw: np.ndarray, fg_ratio: float, bg_dilate: int):
     dist = cv2.distanceTransform(bw, cv2.DIST_L2, 5)
@@ -180,7 +187,7 @@ with st.sidebar:
         index=0,
     )
     tm_thresh = st.slider("Match threshold", 0.1, 0.99, 0.8, 0.01)
-    tm_max_det = st.slider("Max detections", 1, 50, 10, 1)
+    tm_max_det = st.slider("Max detections", 1, 130, 30, 1)
     tm_iou = st.slider("NMS IoU threshold", 0.0, 1.0, 0.3, 0.05)
     tm_source = st.selectbox("Search on", ("Original","Denoised","Pipeline Binary"), index=1)
 
@@ -229,20 +236,14 @@ if use_pipeline:
 # Template Matching UI + Logic
 # -----------------------------
 if enable_tm:
-    tmpl_file = st.file_uploader("Upload template image", type=["png","jpg","jpeg","webp","tif","tiff"], key="tmpl")
-    if tmpl_file is not None:
-        tmpl_pil = load_image(tmpl_file)
-        tmpl_bgr = pil_to_cv(tmpl_pil)
-        st.subheader("Template Preview")
-        st.image(tmpl_pil)
-
-        method_map = {
-            "TM_CCOEFF_NORMED": cv2.TM_CCOEFF_NORMED,
-            "TM_CCORR_NORMED": cv2.TM_CCORR_NORMED,
-            "TM_SQDIFF_NORMED": cv2.TM_SQDIFF_NORMED,
-        }
-        tm_method = method_map[tm_method_name]
-
+    tmpl_files = st.file_uploader(
+        "Upload template image(s)",
+        type=["png","jpg","jpeg","webp","tif","tiff"],
+        key="tmpl",
+        accept_multiple_files=True,
+    )
+    if tmpl_files:
+        # Choose search image
         if tm_source == "Original":
             search_img = img_bgr_in.copy()
         elif tm_source == "Denoised":
@@ -254,37 +255,82 @@ if enable_tm:
             else:
                 search_img = cv2.cvtColor(bw, cv2.COLOR_GRAY2BGR)
 
-        res = run_template_matching(search_img, tmpl_bgr, tm_method)
-        st.subheader("Match Heatmap (normalized)")
-        st.image(res, clamp=True, use_column_width=True)
+        method_map = {
+            "TM_CCOEFF_NORMED": cv2.TM_CCOEFF_NORMED,
+            "TM_CCORR_NORMED": cv2.TM_CCORR_NORMED,
+            "TM_SQDIFF_NORMED": cv2.TM_SQDIFF_NORMED,
+        }
+        tm_method = method_map[tm_method_name]
 
-        h, w = (tmpl_bgr.shape[0], tmpl_bgr.shape[1])
-        rects, scores = [], []
-        if tm_method == cv2.TM_SQDIFF_NORMED:
-            loc = np.where(res <= (1.0 - tm_thresh))
-            for pt in zip(*loc[::-1]):
-                x1, y1, x2, y2 = pt[0], pt[1], pt[0] + w, pt[1] + h
-                rects.append((x1, y1, x2, y2))
-                scores.append(1.0 - float(res[pt[1], pt[0]]))
-        else:
-            loc = np.where(res >= tm_thresh)
-            for pt in zip(*loc[::-1]):
-                x1, y1, x2, y2 = pt[0], pt[1], pt[0] + w, pt[1] + h
-                rects.append((x1, y1, x2, y2))
-                scores.append(float(res[pt[1], pt[0]]))
+        st.subheader("Templates Preview")
+        for f in tmpl_files:
+            st.image(load_image(f), width=120)
 
-        order = nms_rects(rects, scores, tm_iou)
+        # Collect detections across all templates
+        all_rects: List[tuple] = []
+        all_scores: List[float] = []
+        all_tids: List[int] = []
+
+        heatmaps: List[np.ndarray] = []
+        sizes: List[tuple] = []
+        for tidx, f in enumerate(tmpl_files):
+            tmpl_pil = load_image(f)
+            tmpl_bgr = pil_to_cv(tmpl_pil)
+            res = run_template_matching(search_img, tmpl_bgr, tm_method)
+            heatmaps.append(res)
+            h, w = tmpl_bgr.shape[:2]
+            sizes.append((w, h))
+
+            rects, scores = [], []
+            if tm_method == cv2.TM_SQDIFF_NORMED:
+                loc = np.where(res <= (1.0 - tm_thresh))
+                for pt in zip(*loc[::-1]):
+                    x1, y1, x2, y2 = pt[0], pt[1], pt[0] + w, pt[1] + h
+                    rects.append((x1, y1, x2, y2))
+                    scores.append(1.0 - float(res[pt[1], pt[0]]))
+            else:
+                loc = np.where(res >= tm_thresh)
+                for pt in zip(*loc[::-1]):
+                    x1, y1, x2, y2 = pt[0], pt[1], pt[0] + w, pt[1] + h
+                    rects.append((x1, y1, x2, y2))
+                    scores.append(float(res[pt[1], pt[0]]))
+
+            # Per-template NMS then collect
+            keep = nms_rects(rects, scores, tm_iou)
+            for k in keep:
+                all_rects.append(rects[k])
+                all_scores.append(scores[k])
+                all_tids.append(tidx)
+
+        # Global top-K cap (max 130)
+        order = list(range(len(all_rects)))
+        order.sort(key=lambda i: all_scores[i], reverse=True)
         order = order[:tm_max_det]
 
+        # Draw with per-template colors
+        palette = [
+            (0,255,0),(255,0,0),(0,0,255),(255,255,0),(255,0,255),(0,255,255),
+            (128,255,0),(255,128,0),(0,128,255),(128,0,255),(255,0,128),(0,255,128)
+        ]
         draw = search_img.copy()
         for i in order:
-            x1, y1, x2, y2 = rects[i]
-            cv2.rectangle(draw, (x1, y1), (x2, y2), (0, 255, 0), 2)
-        st.subheader("Detections")
+            x1, y1, x2, y2 = all_rects[i]
+            tid = all_tids[i]
+            color = palette[tid % len(palette)]
+            cv2.rectangle(draw, (x1, y1), (x2, y2), color, 2)
+            cv2.putText(draw, f"T{tid}", (x1, max(0,y1-4)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
+
+        st.subheader("Detections (multi-templates)")
         st.image(cv_to_pil(draw), use_column_width=True)
+
+        # Optional: show heatmaps for first few templates
+        with st.expander("Match Heatmaps (normalized)"):
+            for tidx, res in enumerate(heatmaps):
+                st.markdown(f"**Template #{tidx}**")
+                st.image(res, clamp=True, use_column_width=True)
 
         fmt = st.selectbox("Download annotated image format", ("PNG","JPEG"), index=0, key="dl_tm")
         dl_bytes = download_bytes(cv_to_pil(draw), fmt=fmt)
         st.download_button("⬇️ Download annotated", data=dl_bytes, file_name=f"template_matches.{fmt.lower()}", mime=f"image/{fmt.lower()}")
     else:
-        st.info("Upload a template to run matching.")
+        st.info("Upload one or more templates to run matching.")
