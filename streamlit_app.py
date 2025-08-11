@@ -3,6 +3,7 @@ import time
 import zipfile
 from pathlib import Path
 from typing import Tuple, List, Dict, Sequence
+from contextlib import contextmanager
 
 import cv2
 import numpy as np
@@ -274,6 +275,34 @@ with st.sidebar:
     tm_iou = st.slider("NMS IoU", 0.0, 1.0, 0.3, 0.05)
     tm_source = st.selectbox("Search on", ("Original","Denoised","Pipeline Binary"), index=1)
 
+    st.header("Performance")
+    show_perf = st.checkbox("Show performance metrics", value=True)
+
+
+# =============================
+# Perf helpers
+# =============================
+
+@contextmanager
+def time_section(section_name: str, perf_stats: List[Tuple[str, float]]):
+    t0 = time.perf_counter()
+    try:
+        yield
+    finally:
+        perf_stats.append((section_name, time.perf_counter() - t0))
+
+
+def render_perf_stats(title: str, perf_stats: List[Tuple[str, float]]):
+    if not perf_stats:
+        return
+    total = sum(dt for _, dt in perf_stats)
+    rows = [
+        {"Section": name, "Time (ms)": round(dt * 1000.0, 2), "%": round((dt / total) * 100.0, 1)}
+        for name, dt in perf_stats
+    ]
+    st.markdown(f"**{title}** — total {round(total*1000.0,2)} ms")
+    st.table(rows)
+
 # ---- Session helpers for carrying templates & class names from tuning to batch
 if "tm_templates" not in st.session_state:
     st.session_state.tm_templates = None  # list of (name, bytes)
@@ -290,16 +319,21 @@ if mode == "Single image (tune params)":
     if uploaded is None:
         st.stop()
 
-    pil_in = load_image(uploaded)
-    img_bgr_in = pil_to_cv(pil_in)
-    if method == "Non-Local Means (colored)":
-        img_bgr = denoise_nlm_colored(img_bgr_in, *denoise_params)
-    elif method == "Bilateral":
-        img_bgr = denoise_bilateral(img_bgr_in, *denoise_params)
-    elif method == "Median":
-        img_bgr = denoise_median(img_bgr_in, *denoise_params)
-    else:
-        img_bgr = denoise_gaussian(img_bgr_in, *denoise_params)
+    single_perf: List[Tuple[str, float]] = []
+
+    with time_section("load_image", single_perf):
+        pil_in = load_image(uploaded)
+    with time_section("pil_to_cv", single_perf):
+        img_bgr_in = pil_to_cv(pil_in)
+    with time_section(f"denoise:{method}", single_perf):
+        if method == "Non-Local Means (colored)":
+            img_bgr = denoise_nlm_colored(img_bgr_in, *denoise_params)
+        elif method == "Bilateral":
+            img_bgr = denoise_bilateral(img_bgr_in, *denoise_params)
+        elif method == "Median":
+            img_bgr = denoise_median(img_bgr_in, *denoise_params)
+        else:
+            img_bgr = denoise_gaussian(img_bgr_in, *denoise_params)
 
     pil_denoised = cv_to_pil(img_bgr)
     left, right = st.columns(2)
@@ -308,11 +342,16 @@ if mode == "Single image (tune params)":
 
     bw = None
     if use_pipeline:
-        gray_init = to_gray(img_bgr)
-        gray_eq = hist_equalize(gray_init)
-        gray_eroded = erode(gray_eq, er_iter=er_iter, ksize=er_k) if False else erode(gray_eq, er_k, er_iter)
-        bw = binarize(gray_eroded, th_mode, th_value, th_block, th_C)
-        markers, ws_overlay, dist = watershed_segment(img_bgr, bw, ws_fg_ratio, ws_bg_dilate)
+        with time_section("pipeline:to_gray", single_perf):
+            gray_init = to_gray(img_bgr)
+        with time_section("pipeline:hist_equalize", single_perf):
+            gray_eq = hist_equalize(gray_init)
+        with time_section("pipeline:erode", single_perf):
+            gray_eroded = erode(gray_eq, er_iter=er_iter, ksize=er_k) if False else erode(gray_eq, er_k, er_iter)
+        with time_section("pipeline:binarize", single_perf):
+            bw = binarize(gray_eroded, th_mode, th_value, th_block, th_C)
+        with time_section("pipeline:watershed", single_perf):
+            markers, ws_overlay, dist = watershed_segment(img_bgr, bw, ws_fg_ratio, ws_bg_dilate)
         c1, c2, c3 = st.columns(3)
         with c1: st.subheader("Hist Equalized"); st.image(gray_eq, clamp=True)
         with c2: st.subheader("Erosion"); st.image(gray_eroded, clamp=True)
@@ -358,26 +397,30 @@ if mode == "Single image (tune params)":
             palette = [(0,255,0),(255,0,0),(0,0,255),(255,255,0),(255,0,255),(0,255,255),(128,255,0),(255,128,0),(0,128,255),(128,0,255),(255,0,128),(0,255,128)]
 
             for tidx, (nm, b) in enumerate(tuned_templates):
-                tmpl_pil = Image.open(io.BytesIO(b)).convert("RGB")
-                tmpl_bgr = pil_to_cv(tmpl_pil)
-                res = run_template_matching(search_img, tmpl_bgr, tm_method)
+                with time_section(f"tm[{tidx}]:decode_template", single_perf):
+                    tmpl_pil = Image.open(io.BytesIO(b)).convert("RGB")
+                    tmpl_bgr = pil_to_cv(tmpl_pil)
+                with time_section(f"tm[{tidx}]:matchTemplate", single_perf):
+                    res = run_template_matching(search_img, tmpl_bgr, tm_method)
                 h, w = tmpl_bgr.shape[:2]
 
                 rects, scores = [], []
-                if tm_method == cv2.TM_SQDIFF_NORMED:
-                    loc = np.where(res <= (1.0 - tm_thresh))
-                    for pt in zip(*loc[::-1]):
-                        x1, y1, x2, y2 = pt[0], pt[1], pt[0] + w, pt[1] + h
-                        rects.append((x1, y1, x2, y2))
-                        scores.append(1.0 - float(res[pt[1], pt[0]]))
-                else:
-                    loc = np.where(res >= tm_thresh)
-                    for pt in zip(*loc[::-1]):
-                        x1, y1, x2, y2 = pt[0], pt[1], pt[0] + w, pt[1] + h
-                        rects.append((x1, y1, x2, y2))
-                        scores.append(float(res[pt[1], pt[0]]))
+                with time_section(f"tm[{tidx}]:collect_candidates", single_perf):
+                    if tm_method == cv2.TM_SQDIFF_NORMED:
+                        loc = np.where(res <= (1.0 - tm_thresh))
+                        for pt in zip(*loc[::-1]):
+                            x1, y1, x2, y2 = pt[0], pt[1], pt[0] + w, pt[1] + h
+                            rects.append((x1, y1, x2, y2))
+                            scores.append(1.0 - float(res[pt[1], pt[0]]))
+                    else:
+                        loc = np.where(res >= tm_thresh)
+                        for pt in zip(*loc[::-1]):
+                            x1, y1, x2, y2 = pt[0], pt[1], pt[0] + w, pt[1] + h
+                            rects.append((x1, y1, x2, y2))
+                            scores.append(float(res[pt[1], pt[0]]))
 
-                keep = nms_rects(rects, scores, tm_iou)
+                with time_section(f"tm[{tidx}]:nms", single_perf):
+                    keep = nms_rects(rects, scores, tm_iou)
                 for k in keep:
                     all_rects.append(rects[k])
                     all_scores.append(scores[k])
@@ -414,6 +457,10 @@ if mode == "Single image (tune params)":
                     "tm_source": tm_source,
                 }
                 st.success("Saved! Switch to 'Batch export' and upload many images.")
+
+    if show_perf:
+        with st.expander("⏱ Performance (single image)", expanded=False):
+            render_perf_stats("Single-image timings", single_perf)
 
 # =============================
 # BATCH MODE (EXPORT)
@@ -467,19 +514,37 @@ else:
 
     method_map = {"TM_CCOEFF_NORMED": cv2.TM_CCOEFF_NORMED, "TM_CCORR_NORMED": cv2.TM_CCORR_NORMED, "TM_SQDIFF_NORMED": cv2.TM_SQDIFF_NORMED}
 
+    batch_perf_overall: List[Tuple[str, float]] = []
+    batch_rows: List[Tuple[str, List[Tuple[str, float]]]] = []
+
+    # Pre-decode templates once for batch to avoid repeated work
+    decoded_templates = None
+    if tuned_templates:
+        decoded_templates = []
+        for nm, b in tuned_templates:
+            t0 = time.perf_counter()
+            tmpl_pil = Image.open(io.BytesIO(b)).convert("RGB")
+            tmpl_bgr = pil_to_cv(tmpl_pil)
+            decoded_templates.append((nm, tmpl_bgr))
+        # Note: decoding time is not counted per-image; it is one-off
+
     # Process images
     images_info: List[Dict] = []
     for f in uploaded_files:
-        pil_in = load_image(f)
-        img_bgr_in = pil_to_cv(pil_in)
-        if method == "Non-Local Means (colored)":
-            img_bgr = denoise_nlm_colored(img_bgr_in, *denoise_params)
-        elif method == "Bilateral":
-            img_bgr = denoise_bilateral(img_bgr_in, *denoise_params)
-        elif method == "Median":
-            img_bgr = denoise_median(img_bgr_in, *denoise_params)
-        else:
-            img_bgr = denoise_gaussian(img_bgr_in, *denoise_params)
+        per_image_perf: List[Tuple[str, float]] = []
+        with time_section("load_image", per_image_perf):
+            pil_in = load_image(f)
+        with time_section("pil_to_cv", per_image_perf):
+            img_bgr_in = pil_to_cv(pil_in)
+        with time_section(f"denoise:{method}", per_image_perf):
+            if method == "Non-Local Means (colored)":
+                img_bgr = denoise_nlm_colored(img_bgr_in, *denoise_params)
+            elif method == "Bilateral":
+                img_bgr = denoise_bilateral(img_bgr_in, *denoise_params)
+            elif method == "Median":
+                img_bgr = denoise_median(img_bgr_in, *denoise_params)
+            else:
+                img_bgr = denoise_gaussian(img_bgr_in, *denoise_params)
 
         entry = {
             "name": getattr(f, 'name', f"image_{len(images_info)}.jpg"),
@@ -490,12 +555,17 @@ else:
             "bw": None,
         }
         if use_pipeline:
-            gray_init = to_gray(img_bgr)
-            gray_eq = hist_equalize(gray_init)
-            gray_eroded = erode(gray_eq, er_k, er_iter)
-            bw = binarize(gray_eroded, th_mode, th_value, th_block, th_C)
+            with time_section("pipeline:to_gray", per_image_perf):
+                gray_init = to_gray(img_bgr)
+            with time_section("pipeline:hist_equalize", per_image_perf):
+                gray_eq = hist_equalize(gray_init)
+            with time_section("pipeline:erode", per_image_perf):
+                gray_eroded = erode(gray_eq, er_k, er_iter)
+            with time_section("pipeline:binarize", per_image_perf):
+                bw = binarize(gray_eroded, th_mode, th_value, th_block, th_C)
             entry.update({"bw": bw})
         images_info.append(entry)
+        batch_rows.append((entry["name"], per_image_perf))
 
     # Run TM per image
     palette = [(0,255,0),(255,0,0),(0,0,255),(255,255,0),(255,0,255),(0,255,255),(128,255,0),(255,128,0),(0,128,255),(128,0,255),(255,0,128),(0,255,128)]
@@ -524,31 +594,36 @@ else:
 
         if tuned_templates:
             tm_method = method_map[_tm["tm_method_name"]]
-            for tidx, (nm, b) in enumerate(tuned_templates):
-                tmpl_pil = Image.open(io.BytesIO(b)).convert("RGB")
-                tmpl_bgr = pil_to_cv(tmpl_pil)
-                res = run_template_matching(search_img, tmpl_bgr, tm_method)
+            # Use pre-decoded templates
+            for tidx, (nm, tmpl_bgr) in enumerate(decoded_templates or []):
+                tmp_perf: List[Tuple[str, float]] = []
+                with time_section(f"tm[{tidx}]:matchTemplate", tmp_perf):
+                    res = run_template_matching(search_img, tmpl_bgr, tm_method)
                 h, w = tmpl_bgr.shape[:2]
 
                 rects, scores = [], []
-                if tm_method == cv2.TM_SQDIFF_NORMED:
-                    loc = np.where(res <= (1.0 - _tm["tm_thresh"]))
-                    for pt in zip(*loc[::-1]):
-                        x1, y1, x2, y2 = pt[0], pt[1], pt[0] + w, pt[1] + h
-                        rects.append((x1, y1, x2, y2))
-                        scores.append(1.0 - float(res[pt[1], pt[0]]))
-                else:
-                    loc = np.where(res >= _tm["tm_thresh"]) 
-                    for pt in zip(*loc[::-1]):
-                        x1, y1, x2, y2 = pt[0], pt[1], pt[0] + w, pt[1] + h
-                        rects.append((x1, y1, x2, y2))
-                        scores.append(float(res[pt[1], pt[0]]))
+                with time_section(f"tm[{tidx}]:collect_candidates", tmp_perf):
+                    if tm_method == cv2.TM_SQDIFF_NORMED:
+                        loc = np.where(res <= (1.0 - _tm["tm_thresh"]))
+                        for pt in zip(*loc[::-1]):
+                            x1, y1, x2, y2 = pt[0], pt[1], pt[0] + w, pt[1] + h
+                            rects.append((x1, y1, x2, y2))
+                            scores.append(1.0 - float(res[pt[1], pt[0]]))
+                    else:
+                        loc = np.where(res >= _tm["tm_thresh"]) 
+                        for pt in zip(*loc[::-1]):
+                            x1, y1, x2, y2 = pt[0], pt[1], pt[0] + w, pt[1] + h
+                            rects.append((x1, y1, x2, y2))
+                            scores.append(float(res[pt[1], pt[0]]))
 
-                keep = nms_rects(rects, scores, _tm["tm_iou"]) 
+                with time_section(f"tm[{tidx}]:nms", tmp_perf):
+                    keep = nms_rects(rects, scores, _tm["tm_iou"]) 
                 for k in keep:
                     all_rects.append(rects[k])
                     all_scores.append(scores[k])
                     all_tids.append(tidx)
+                # accumulate tm perf into per-image perf rows for visibility
+                batch_rows.append((f"{info['name']}::tm[{tidx}]", tmp_perf))
 
         order = list(range(len(all_rects)))
         order.sort(key=lambda i: all_scores[i], reverse=True)
@@ -630,3 +705,10 @@ else:
                 st.success("Dataset ready. data=dataset/dataset.yaml (annotated previews in dataset/annotated/...).")
             except Exception as e:
                 st.error(f"Failed to build dataset: {e}")
+
+    if show_perf and batch_rows:
+        with st.expander("⏱ Performance (batch)", expanded=False):
+            # Show last N images' perf summaries for brevity
+            max_rows = 8
+            for name, stats in batch_rows[-max_rows:]:
+                render_perf_stats(str(name), stats)
