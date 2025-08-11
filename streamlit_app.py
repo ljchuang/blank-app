@@ -2,7 +2,7 @@ import io
 import time
 import zipfile
 from pathlib import Path
-from typing import Tuple, List, Dict, Sequence, Optional
+from typing import Tuple, List, Dict, Sequence
 
 import cv2
 import numpy as np
@@ -142,7 +142,7 @@ def run_template_matching(src_img: np.ndarray, tmpl_img: np.ndarray, method: int
     return res
 
 # =============================
-# YOLO helpers + auto split (with annotated previews)
+# YOLO helpers + auto split + annotated export
 # =============================
 
 def rect_to_yolo(x1: int, y1: int, x2: int, y2: int, img_w: int, img_h: int) -> Tuple[float, float, float, float]:
@@ -168,31 +168,22 @@ def simple_train_val_split(n_items: int, train_ratio: float, seed: int) -> List[
     return split
 
 
-def _yaml_names_block(class_names: List[str]) -> str:
-    lines = ["names:"]
-    for n in class_names:
-        lines.append(f"- {n}")
-    return "\n".join(lines)
-
-
-def build_yolo_zip_auto(
-    image_entries: List[Tuple[Image.Image, str, List[tuple], List[int], Optional[Image.Image]]],
+def build_yolo_zip_with_ann(
+    image_entries: List[Tuple[Image.Image, str, List[tuple], List[int], Image.Image]],
     class_names: List[str],
-    per_entry_split: Sequence[str],  # "train" or "val"
+    per_entry_split: Sequence[str],
     img_format: str = "JPEG",
     quality: int = 95,
 ) -> bytes:
-    """
-    image_entries: list of tuples -> (export_pil, original_name, det_rects, det_tids, annotated_preview_pil)
-    Writes images, labels, dataset.yaml, and annotated previews into the ZIP.
-    Previews are saved under dataset/previews/<split>/.
+    """Create a YOLO dataset zip including annotated previews.
+    image_entries: list of (export_pil, filename, rects, tids, annotated_pil)
     """
     zbuf = io.BytesIO()
     with zipfile.ZipFile(zbuf, 'w', zipfile.ZIP_DEFLATED) as z:
-        for (pil_img, orig_name, det_rects, det_tids, ann_pil), sp in zip(image_entries, per_entry_split):
+        for (pil_img, orig_name, det_rects, det_tids, annotated_pil), sp in zip(image_entries, per_entry_split):
             stem = Path(orig_name).stem or f"img_{int(time.time()*1000)}"
 
-            # --- image bytes ---
+            # Save original image (export target)
             img_bytes = io.BytesIO()
             if img_format.upper() == "JPEG":
                 pil_img.save(img_bytes, format="JPEG", quality=quality)
@@ -201,11 +192,15 @@ def build_yolo_zip_auto(
                 pil_img.save(img_bytes, format="PNG")
                 img_ext = ".png"
             img_bytes.seek(0)
+            z.writestr(f"dataset/images/{sp}/{stem}{img_ext}", img_bytes.read())
 
-            img_zip_path = f"dataset/images/{sp}/{stem}{img_ext}"
-            z.writestr(img_zip_path, img_bytes.read())
+            # Save annotated preview (always JPEG inside zip for compactness)
+            ann_bytes = io.BytesIO()
+            annotated_pil.save(ann_bytes, format="JPEG", quality=92)
+            ann_bytes.seek(0)
+            z.writestr(f"dataset/annotated/{sp}/{stem}.jpg", ann_bytes.read())
 
-            # --- label txt ---
+            # Save YOLO label
             W, H = pil_img.size
             lines = []
             for rect, tid in zip(det_rects, det_tids):
@@ -213,32 +208,16 @@ def build_yolo_zip_auto(
                 cx, cy, w, h = rect_to_yolo(x1, y1, x2, y2, W, H)
                 cls_id = int(tid)
                 lines.append(f"{cls_id} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}")
-            label_zip_path = f"dataset/labels/{sp}/{stem}.txt"
-            z.writestr(label_zip_path, "\n".join(lines))
+            z.writestr(f"dataset/labels/{sp}/{stem}.txt", "\n".join(lines))
 
-            # --- annotated preview (optional) ---
-            if ann_pil is not None:
-                prev_bytes = io.BytesIO()
-                # Save previews using same format for simplicity
-                if img_format.upper() == "JPEG":
-                    ann_pil.save(prev_bytes, format="JPEG", quality=min(95, quality))
-                    prev_ext = ".jpg"
-                else:
-                    ann_pil.save(prev_bytes, format="PNG")
-                    prev_ext = ".png"
-                prev_bytes.seek(0)
-                prev_zip_path = f"dataset/previews/{sp}/{stem}{prev_ext}"
-                z.writestr(prev_zip_path, prev_bytes.read())
-
-        # --- dataset.yaml ---
-        yaml_lines = [
+        yaml = [
             "path: .",
             "train: images/train",
             "val: images/val",
             "test: ",
-            _yaml_names_block(class_names),
+            f"names: {class_names}",
         ]
-        z.writestr("dataset/dataset.yaml", "\n".join(yaml_lines))
+        z.writestr("dataset/dataset.yaml", "\n".join(yaml))
 
     zbuf.seek(0)
     return zbuf.read()
@@ -248,9 +227,13 @@ def build_yolo_zip_auto(
 # =============================
 
 st.set_page_config(page_title="Image Denoise Lab", page_icon="🧽", layout="wide")
-st.title("🧽 Image Denoise Lab — Auto train/val split + Annotated previews in ZIP")
+st.title("🧽 Image Denoise Lab — Single Tuning & Batch Export")
 
+# ---- Sidebar controls
 with st.sidebar:
+    st.header("Mode")
+    mode = st.radio("Choose workflow", ("Single image (tune params)", "Batch export (use current params)"), index=0)
+
     st.header("Denoise")
     method = st.selectbox("Method", ("Non-Local Means (colored)","Bilateral","Median","Gaussian"))
     if method == "Non-Local Means (colored)":
@@ -291,15 +274,23 @@ with st.sidebar:
     tm_iou = st.slider("NMS IoU", 0.0, 1.0, 0.3, 0.05)
     tm_source = st.selectbox("Search on", ("Original","Denoised","Pipeline Binary"), index=1)
 
-# Upload images
-uploaded_files = st.file_uploader("Upload images", type=["png","jpg","jpeg","webp","tif","tiff"], accept_multiple_files=True)
-if not uploaded_files:
-    st.stop()
+# ---- Session helpers for carrying templates & class names from tuning to batch
+if "tm_templates" not in st.session_state:
+    st.session_state.tm_templates = None  # list of (name, bytes)
+if "tm_class_names" not in st.session_state:
+    st.session_state.tm_class_names = None  # list[str]
+if "tm_settings" not in st.session_state:
+    st.session_state.tm_settings = None  # dict of thresholds etc.
 
-# Load + process
-images_info: List[Dict] = []
-for f in uploaded_files:
-    pil_in = load_image(f)
+# =============================
+# SINGLE IMAGE MODE (TUNE)
+# =============================
+if mode == "Single image (tune params)":
+    uploaded = st.file_uploader("Upload ONE image", type=["png","jpg","jpeg","webp","tif","tiff"], accept_multiple_files=False)
+    if uploaded is None:
+        st.stop()
+
+    pil_in = load_image(uploaded)
     img_bgr_in = pil_to_cv(pil_in)
     if method == "Non-Local Means (colored)":
         img_bgr = denoise_nlm_colored(img_bgr_in, *denoise_params)
@@ -310,67 +301,64 @@ for f in uploaded_files:
     else:
         img_bgr = denoise_gaussian(img_bgr_in, *denoise_params)
 
-    entry = {
-        "name": getattr(f, 'name', f"image_{len(images_info)}.jpg"),
-        "pil_in": pil_in,
-        "img_bgr_in": img_bgr_in,
-        "img_bgr": img_bgr,
-        "pil_denoised": cv_to_pil(img_bgr),
-        "bw": None,
-        "ws_overlay": None,
-        "dist": None,
-    }
+    pil_denoised = cv_to_pil(img_bgr)
+    left, right = st.columns(2)
+    with left: st.subheader("Original"); st.image(pil_in)
+    with right: st.subheader("Denoised"); st.image(pil_denoised)
+
+    bw = None
     if use_pipeline:
         gray_init = to_gray(img_bgr)
         gray_eq = hist_equalize(gray_init)
-        gray_eroded = erode(gray_eq, er_k, er_iter)
+        gray_eroded = erode(gray_eq, er_iter=er_iter, ksize=er_k) if False else erode(gray_eq, er_k, er_iter)
         bw = binarize(gray_eroded, th_mode, th_value, th_block, th_C)
         markers, ws_overlay, dist = watershed_segment(img_bgr, bw, ws_fg_ratio, ws_bg_dilate)
-        entry.update({"gray_eq": gray_eq, "gray_eroded": gray_eroded, "bw": bw, "ws_overlay": ws_overlay, "dist": dist})
-    images_info.append(entry)
+        c1, c2, c3 = st.columns(3)
+        with c1: st.subheader("Hist Equalized"); st.image(gray_eq, clamp=True)
+        with c2: st.subheader("Erosion"); st.image(gray_eroded, clamp=True)
+        with c3: st.subheader("Binary"); st.image(bw, clamp=True)
+        c4, c5 = st.columns(2)
+        with c4:
+            st.subheader("Distance Transform")
+            dist_vis = cv2.normalize(dist, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+            st.image(dist_vis, clamp=True)
+        with c5: st.subheader("Watershed Overlay"); st.image(cv_to_pil(ws_overlay))
 
-# Quick preview
-st.subheader("Preview (first 6)")
-cols = st.columns(6)
-for i, info in enumerate(images_info[:6]):
-    with cols[i % 6]:
-        st.image(info["pil_in"], caption=info["name"], use_column_width=True)
-
-# Template matching
-all_results: Dict[str, Dict] = {}
-if enable_tm:
-    tmpl_files = st.file_uploader("Upload templates", type=["png","jpg","jpeg","webp","tif","tiff"], key="tmpl", accept_multiple_files=True)
-    if tmpl_files:
-        method_map = {"TM_CCOEFF_NORMED": cv2.TM_CCOEFF_NORMED, "TM_CCORR_NORMED": cv2.TM_CCORR_NORMED, "TM_SQDIFF_NORMED": cv2.TM_SQDIFF_NORMED}
-        tm_method = method_map[tm_method_name]
-
-        st.subheader("Templates Preview")
-        for f in tmpl_files:
-            st.image(load_image(f), width=120)
-
-        palette = [(0,255,0),(255,0,0),(0,0,255),(255,255,0),(255,0,255),(0,255,255),(128,255,0),(255,128,0),(0,128,255),(128,0,255),(255,0,128),(0,255,128)]
-
-        for info in images_info:
+    tuned_templates = []
+    class_names = []
+    if enable_tm:
+        tmpl_files = st.file_uploader("Upload template image(s)", type=["png","jpg","jpeg","webp","tif","tiff"], key="tmpl_single", accept_multiple_files=True)
+        if tmpl_files:
+            # pick search image
             if tm_source == "Original":
-                search_img = info["img_bgr_in"].copy()
-                export_pil_img = info["pil_in"]
+                search_img = img_bgr_in.copy(); export_pil_img = pil_in
             elif tm_source == "Denoised":
-                search_img = info["img_bgr"].copy()
-                export_pil_img = info["pil_denoised"]
+                search_img = img_bgr.copy(); export_pil_img = pil_denoised
             else:
-                if info.get("bw") is None:
-                    search_img = info["img_bgr"].copy()
-                    export_pil_img = info["pil_denoised"]
+                if bw is None:
+                    st.warning("Pipeline Binary not available; using Denoised.")
+                    search_img = img_bgr.copy(); export_pil_img = pil_denoised
                 else:
-                    search_img = cv2.cvtColor(info["bw"], cv2.COLOR_GRAY2BGR)
+                    search_img = cv2.cvtColor(bw, cv2.COLOR_GRAY2BGR)
                     export_pil_img = cv_to_pil(search_img)
 
+            method_map = {"TM_CCOEFF_NORMED": cv2.TM_CCOEFF_NORMED, "TM_CCORR_NORMED": cv2.TM_CCORR_NORMED, "TM_SQDIFF_NORMED": cv2.TM_SQDIFF_NORMED}
+            tm_method = method_map[tm_method_name]
+
+            st.subheader("Templates Preview")
+            for f in tmpl_files:
+                p = load_image(f)
+                st.image(p, width=120)
+                tuned_templates.append((getattr(f, 'name', 'tmpl'), download_bytes(p, fmt="PNG")))
+
+            # matching
             all_rects: List[tuple] = []
             all_scores: List[float] = []
             all_tids: List[int] = []
+            palette = [(0,255,0),(255,0,0),(0,0,255),(255,255,0),(255,0,255),(0,255,255),(128,255,0),(255,128,0),(0,128,255),(128,0,255),(255,0,128),(0,255,128)]
 
-            for tidx, f in enumerate(tmpl_files):
-                tmpl_pil = load_image(f)
+            for tidx, (nm, b) in enumerate(tuned_templates):
+                tmpl_pil = Image.open(io.BytesIO(b)).convert("RGB")
                 tmpl_bgr = pil_to_cv(tmpl_pil)
                 res = run_template_matching(search_img, tmpl_bgr, tm_method)
                 h, w = tmpl_bgr.shape[:2]
@@ -407,70 +395,238 @@ if enable_tm:
                 cv2.rectangle(draw, (x1, y1), (x2, y2), color, 2)
                 cv2.putText(draw, f"T{tid}", (x1, max(0,y1-4)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
 
-            all_results[info["name"]] = {
-                "rects": [all_rects[i] for i in order],
-                "scores": [all_scores[i] for i in order],
-                "tids": [all_tids[i] for i in order],
-                "annotated_pil": cv_to_pil(draw),
-                "export_pil": export_pil_img,
-            }
+            st.subheader("Detections (preview)")
+            annotated_pil = cv_to_pil(draw)
+            st.image(annotated_pil, use_column_width=True)
 
-        st.subheader("Detections (annotated previews)")
-        cols = st.columns(3)
-        for i, (name, res) in enumerate(all_results.items()):
-            with cols[i % 3]:
-                st.image(res["annotated_pil"], caption=name, use_column_width=True)
+            st.markdown("**Assign class names** (per template)")
+            for tidx in range(len(tuned_templates)):
+                class_names.append(st.text_input(f"Class name for template #{tidx}", value=f"class_{tidx}", key=f"cls_tune_{tidx}"))
 
-        # =============================
-        # AUTO TRAIN/VAL SPLIT EXPORT
-        # =============================
-        with st.expander("📦 Export YOLO dataset with AUTO train/val split"):
-            # Class names for templates
-            class_names: List[str] = []
-            for tidx in range(len(tmpl_files)):
-                default_name = f"class_{tidx}"
-                cls = st.text_input(f"Class name for template #{tidx}", value=default_name, key=f"clsname_auto_{tidx}")
-                class_names.append(cls)
+            if st.button("Save templates & settings for batch"):
+                st.session_state.tm_templates = tuned_templates
+                st.session_state.tm_class_names = class_names
+                st.session_state.tm_settings = {
+                    "tm_method_name": tm_method_name,
+                    "tm_thresh": tm_thresh,
+                    "tm_max_det": tm_max_det,
+                    "tm_iou": tm_iou,
+                    "tm_source": tm_source,
+                }
+                st.success("Saved! Switch to 'Batch export' and upload many images.")
 
-            train_ratio = st.slider("Train ratio", 0.1, 0.95, 0.8, 0.05)
-            seed = st.number_input("Random seed", value=42, step=1)
-            img_fmt = st.selectbox("Image format", ("JPEG","PNG"), index=0, key="yolo_imgfmt_auto")
-            q = 95
-            if img_fmt == "JPEG":
-                q = st.slider("JPEG quality", 60, 100, 95, 1, key="yolo_jpgq_auto")
+# =============================
+# BATCH MODE (EXPORT)
+# =============================
+else:
+    # Templates: prefer tuned ones from session; fallback to new upload
+    tuned_templates = st.session_state.tm_templates
+    class_names = st.session_state.tm_class_names
+    tm_settings = st.session_state.tm_settings
 
-            # Prepare entries
-            entries: List[Tuple[Image.Image, str, List[tuple], List[int], Optional[Image.Image]]] = []
-            names = []
-            for info in images_info:
-                name = info["name"]
-                names.append(name)
-                if name not in all_results:
-                    export_pil = info["pil_denoised"] if tm_source == "Denoised" else info["pil_in"]
-                    entries.append((export_pil, name, [], [], None))
-                else:
-                    res = all_results[name]
-                    entries.append((res["export_pil"], name, res["rects"], res["tids"], res.get("annotated_pil")))
-
-            per_split = simple_train_val_split(len(entries), train_ratio, int(seed))
-
-            if st.button("Build YOLO dataset zip (auto split)", type="primary"):
-                try:
-                    yolo_zip = build_yolo_zip_auto(
-                        image_entries=entries,
-                        class_names=class_names,
-                        per_entry_split=per_split,
-                        img_format=img_fmt,
-                        quality=q,
-                    )
-                    st.download_button(
-                        "⬇️ Download dataset_auto_split.zip",
-                        data=yolo_zip,
-                        file_name="yolo_dataset_auto_split.zip",
-                        mime="application/zip",
-                    )
-                    st.success("YOLO dataset ready with automatic train/val split, plus annotated previews under dataset/previews/. Train via data=dataset/dataset.yaml.")
-                except Exception as e:
-                    st.error(f"Failed to build dataset: {e}")
+    st.subheader("Templates for batch")
+    if tuned_templates is None:
+        st.info("No saved templates from tuning. Upload templates now.")
+        up_tmpls = st.file_uploader("Upload template image(s)", type=["png","jpg","jpeg","webp","tif","tiff"], key="tmpl_batch", accept_multiple_files=True)
+        tuned_templates = []
+        if up_tmpls:
+            for f in up_tmpls:
+                p = load_image(f)
+                tuned_templates.append((getattr(f, 'name', 'tmpl'), download_bytes(p, fmt="PNG")))
+        if class_names is None and tuned_templates:
+            class_names = [f"class_{i}" for i in range(len(tuned_templates))]
     else:
-        st.info("Upload one or more templates to run matching.")
+        # show previews
+        cols = st.columns(6)
+        for i, (nm, b) in enumerate(tuned_templates[:6]):
+            with cols[i % 6]:
+                st.image(Image.open(io.BytesIO(b)), caption=nm, use_column_width=True)
+
+    # Allow editing class names
+    if tuned_templates:
+        st.markdown("**Class names (editable)**")
+        new_names = []
+        for i in range(len(tuned_templates)):
+            default = class_names[i] if class_names and i < len(class_names) else f"class_{i}"
+            new_names.append(st.text_input(f"Class #{i}", value=default, key=f"cls_batch_{i}"))
+        class_names = new_names
+
+    # Batch images
+    uploaded_files = st.file_uploader("Upload multiple images", type=["png","jpg","jpeg","webp","tif","tiff"], accept_multiple_files=True)
+    if not uploaded_files:
+        st.stop()
+
+    # Use tm_settings if available; else current sidebar values
+    _tm = tm_settings or {
+        "tm_method_name": tm_method_name,
+        "tm_thresh": tm_thresh,
+        "tm_max_det": tm_max_det,
+        "tm_iou": tm_iou,
+        "tm_source": tm_source,
+    }
+
+    method_map = {"TM_CCOEFF_NORMED": cv2.TM_CCOEFF_NORMED, "TM_CCORR_NORMED": cv2.TM_CCORR_NORMED, "TM_SQDIFF_NORMED": cv2.TM_SQDIFF_NORMED}
+
+    # Process images
+    images_info: List[Dict] = []
+    for f in uploaded_files:
+        pil_in = load_image(f)
+        img_bgr_in = pil_to_cv(pil_in)
+        if method == "Non-Local Means (colored)":
+            img_bgr = denoise_nlm_colored(img_bgr_in, *denoise_params)
+        elif method == "Bilateral":
+            img_bgr = denoise_bilateral(img_bgr_in, *denoise_params)
+        elif method == "Median":
+            img_bgr = denoise_median(img_bgr_in, *denoise_params)
+        else:
+            img_bgr = denoise_gaussian(img_bgr_in, *denoise_params)
+
+        entry = {
+            "name": getattr(f, 'name', f"image_{len(images_info)}.jpg"),
+            "pil_in": pil_in,
+            "img_bgr_in": img_bgr_in,
+            "img_bgr": img_bgr,
+            "pil_denoised": cv_to_pil(img_bgr),
+            "bw": None,
+        }
+        if use_pipeline:
+            gray_init = to_gray(img_bgr)
+            gray_eq = hist_equalize(gray_init)
+            gray_eroded = erode(gray_eq, er_k, er_iter)
+            bw = binarize(gray_eroded, th_mode, th_value, th_block, th_C)
+            entry.update({"bw": bw})
+        images_info.append(entry)
+
+    # Run TM per image
+    palette = [(0,255,0),(255,0,0),(0,0,255),(255,255,0),(255,0,255),(0,255,255),(128,255,0),(255,128,0),(0,128,255),(128,0,255),(255,0,128),(0,255,128)]
+    all_results: Dict[str, Dict] = {}
+
+    if not tuned_templates:
+        st.warning("No templates provided. Export will include empty labels.")
+
+    for info in images_info:
+        # choose search source
+        src_choice = _tm["tm_source"]
+        if src_choice == "Original":
+            search_img = info["img_bgr_in"].copy(); export_pil_img = info["pil_in"]
+        elif src_choice == "Denoised":
+            search_img = info["img_bgr"].copy(); export_pil_img = info["pil_denoised"]
+        else:
+            if info.get("bw") is None:
+                search_img = info["img_bgr"].copy(); export_pil_img = info["pil_denoised"]
+            else:
+                search_img = cv2.cvtColor(info["bw"], cv2.COLOR_GRAY2BGR)
+                export_pil_img = cv_to_pil(search_img)
+
+        all_rects: List[tuple] = []
+        all_scores: List[float] = []
+        all_tids: List[int] = []
+
+        if tuned_templates:
+            tm_method = method_map[_tm["tm_method_name"]]
+            for tidx, (nm, b) in enumerate(tuned_templates):
+                tmpl_pil = Image.open(io.BytesIO(b)).convert("RGB")
+                tmpl_bgr = pil_to_cv(tmpl_pil)
+                res = run_template_matching(search_img, tmpl_bgr, tm_method)
+                h, w = tmpl_bgr.shape[:2]
+
+                rects, scores = [], []
+                if tm_method == cv2.TM_SQDIFF_NORMED:
+                    loc = np.where(res <= (1.0 - _tm["tm_thresh"]))
+                    for pt in zip(*loc[::-1]):
+                        x1, y1, x2, y2 = pt[0], pt[1], pt[0] + w, pt[1] + h
+                        rects.append((x1, y1, x2, y2))
+                        scores.append(1.0 - float(res[pt[1], pt[0]]))
+                else:
+                    loc = np.where(res >= _tm["tm_thresh"]) 
+                    for pt in zip(*loc[::-1]):
+                        x1, y1, x2, y2 = pt[0], pt[1], pt[0] + w, pt[1] + h
+                        rects.append((x1, y1, x2, y2))
+                        scores.append(float(res[pt[1], pt[0]]))
+
+                keep = nms_rects(rects, scores, _tm["tm_iou"]) 
+                for k in keep:
+                    all_rects.append(rects[k])
+                    all_scores.append(scores[k])
+                    all_tids.append(tidx)
+
+        order = list(range(len(all_rects)))
+        order.sort(key=lambda i: all_scores[i], reverse=True)
+        order = order[:_tm["tm_max_det"]]
+
+        draw = search_img.copy()
+        for i in order:
+            x1, y1, x2, y2 = all_rects[i]
+            tid = all_tids[i] if all_tids else 0
+            color = palette[tid % len(palette)]
+            cv2.rectangle(draw, (x1, y1), (x2, y2), color, 2)
+            cv2.putText(draw, f"T{tid}", (x1, max(0,y1-4)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
+
+        all_results[info["name"]] = {
+            "rects": [all_rects[i] for i in order],
+            "scores": [all_scores[i] for i in order],
+            "tids": [all_tids[i] for i in order],
+            "annotated_pil": cv_to_pil(draw),
+            "export_pil": export_pil_img,
+        }
+
+    st.subheader("Detections (annotated previews)")
+    cols = st.columns(3)
+    for i, (name, res) in enumerate(all_results.items()):
+        with cols[i % 3]:
+            st.image(res["annotated_pil"], caption=name, use_column_width=True)
+
+    # ---- Export section
+    with st.expander("📦 Export YOLO dataset (auto train/val split) + annotated previews"):
+        if not tuned_templates:
+            st.warning("You have no templates. Labels will be empty unless you go back to Single mode and save templates.")
+        if not class_names and tuned_templates:
+            class_names = [f"class_{i}" for i in range(len(tuned_templates))]
+
+        # editable class names
+        if tuned_templates:
+            st.markdown("**Class names (editable)**")
+            new_names = []
+            for i in range(len(tuned_templates)):
+                default = class_names[i] if class_names and i < len(class_names) else f"class_{i}"
+                new_names.append(st.text_input(f"Class #{i}", value=default, key=f"cls_export_{i}"))
+            class_names = new_names
+
+        train_ratio = st.slider("Train ratio", 0.1, 0.95, 0.8, 0.05)
+        seed = st.number_input("Random seed", value=42, step=1)
+        img_fmt = st.selectbox("Image format", ("JPEG","PNG"), index=0, key="yolo_imgfmt_export")
+        q = 95
+        if img_fmt == "JPEG":
+            q = st.slider("JPEG quality", 60, 100, 95, 1, key="yolo_jpgq_export")
+
+        # entries with annotated previews
+        entries: List[Tuple[Image.Image, str, List[tuple], List[int], Image.Image]] = []
+        for info in images_info:
+            name = info["name"]
+            if name not in all_results:
+                export_pil = info["pil_denoised"] if _tm["tm_source"] == "Denoised" else info["pil_in"]
+                entries.append((export_pil, name, [], [], export_pil))
+            else:
+                res = all_results[name]
+                entries.append((res["export_pil"], name, res["rects"], res["tids"], res["annotated_pil"]))
+
+        per_split = simple_train_val_split(len(entries), train_ratio, int(seed))
+
+        if st.button("Build YOLO dataset zip (with annotated previews)", type="primary"):
+            try:
+                yolo_zip = build_yolo_zip_with_ann(
+                    image_entries=entries,
+                    class_names=class_names if class_names else [],
+                    per_entry_split=per_split,
+                    img_format=img_fmt,
+                    quality=q,
+                )
+                st.download_button(
+                    "⬇️ Download yolo_dataset_with_annotated.zip",
+                    data=yolo_zip,
+                    file_name="yolo_dataset_with_annotated.zip",
+                    mime="application/zip",
+                )
+                st.success("Dataset ready. data=dataset/dataset.yaml (annotated previews in dataset/annotated/...).")
+            except Exception as e:
+                st.error(f"Failed to build dataset: {e}")
