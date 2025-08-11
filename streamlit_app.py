@@ -114,24 +114,44 @@ def watershed_segment(img_bgr: np.ndarray, bw: np.ndarray, fg_ratio: float, bg_d
 def nms_rects(rects: List[tuple], scores: List[float], iou_thr: float) -> List[int]:
     if not rects:
         return []
-    idxs = list(range(len(rects)))
-    idxs.sort(key=lambda i: scores[i], reverse=True)
-    keep = []
-    def iou(a, b):
-        ax1, ay1, ax2, ay2 = a
-        bx1, by1, bx2, by2 = b
-        inter_x1, inter_y1 = max(ax1, bx1), max(ay1, by1)
-        inter_x2, inter_y2 = min(ax2, bx2), min(ay2, by2)
-        iw, ih = max(0, inter_x2 - inter_x1), max(0, inter_y2 - inter_y1)
-        inter = iw * ih
-        area_a = (ax2 - ax1) * (ay2 - ay1)
-        area_b = (bx2 - bx1) * (by2 - by1)
-        union = area_a + area_b - inter + 1e-6
-        return inter / union
-    while idxs:
-        i = idxs.pop(0)
+    # Try OpenCV's C++ NMS first for speed
+    try:
+        boxes_xywh = [[x1, y1, x2 - x1, y2 - y1] for (x1, y1, x2, y2) in rects]
+        idxs = cv2.dnn.NMSBoxes(boxes_xywh, scores, score_threshold=0.0, nms_threshold=float(iou_thr))
+        if idxs is None or len(idxs) == 0:
+            return []
+        if isinstance(idxs, np.ndarray):
+            keep = idxs.flatten().astype(int).tolist()
+        else:
+            # OpenCV may return list of lists
+            keep = [int(i[0]) if isinstance(i, (list, tuple, np.ndarray)) else int(i) for i in idxs]
+        keep.sort(key=lambda i: scores[i], reverse=True)
+        return keep
+    except Exception:
+        pass
+
+    # Fallback: vectorized NumPy NMS
+    boxes = np.asarray(rects, dtype=np.float32)
+    sc = np.asarray(scores, dtype=np.float32)
+    x1, y1, x2, y2 = boxes.T
+    areas = (x2 - x1) * (y2 - y1)
+    order = sc.argsort()[::-1]
+    keep: List[int] = []
+    while order.size > 0:
+        i = int(order[0])
         keep.append(i)
-        idxs = [j for j in idxs if iou(rects[i], rects[j]) < iou_thr]
+        if order.size == 1:
+            break
+        xx1 = np.maximum(x1[i], x1[order[1:]])
+        yy1 = np.maximum(y1[i], y1[order[1:]])
+        xx2 = np.minimum(x2[i], x2[order[1:]])
+        yy2 = np.minimum(y2[i], y2[order[1:]])
+        w = np.maximum(0.0, xx2 - xx1)
+        h = np.maximum(0.0, yy2 - yy1)
+        inter = w * h
+        iou = inter / (areas[i] + areas[order[1:]] - inter + 1e-6)
+        remain = np.where(iou < iou_thr)[0]
+        order = order[remain + 1]
     return keep
 
 
@@ -406,18 +426,27 @@ if mode == "Single image (tune params)":
 
                 rects, scores = [], []
                 with time_section(f"tm[{tidx}]:collect_candidates", single_perf):
-                    if tm_method == cv2.TM_SQDIFF_NORMED:
-                        loc = np.where(res <= (1.0 - tm_thresh))
-                        for pt in zip(*loc[::-1]):
-                            x1, y1, x2, y2 = pt[0], pt[1], pt[0] + w, pt[1] + h
-                            rects.append((x1, y1, x2, y2))
-                            scores.append(1.0 - float(res[pt[1], pt[0]]))
-                    else:
-                        loc = np.where(res >= tm_thresh)
-                        for pt in zip(*loc[::-1]):
-                            x1, y1, x2, y2 = pt[0], pt[1], pt[0] + w, pt[1] + h
-                            rects.append((x1, y1, x2, y2))
-                            scores.append(float(res[pt[1], pt[0]]))
+                    is_sqdiff = (tm_method == cv2.TM_SQDIFF_NORMED)
+                    res_for_max = (1.0 - res) if is_sqdiff else res
+                    thr = (1.0 - tm_thresh) if is_sqdiff else tm_thresh
+                    # local maxima filter (dilate) + threshold
+                    ks = 5
+                    kernel = np.ones((ks, ks), np.uint8)
+                    res_dil = cv2.dilate(res_for_max, kernel)
+                    peak_mask = (res_for_max >= (res_dil - 1e-12)) & (res_for_max >= thr)
+                    ys, xs = np.where(peak_mask)
+                    vals = res_for_max[ys, xs]
+                    # top-K prune
+                    K = 800
+                    if vals.size > K:
+                        kth = np.partition(vals, -K)[-K]
+                        sel = vals >= kth
+                        xs, ys, vals = xs[sel], ys[sel], vals[sel]
+                    rects, scores = [], []
+                    for x, y, v in zip(xs, ys, vals):
+                        x1, y1, x2, y2 = int(x), int(y), int(x + w), int(y + h)
+                        rects.append((x1, y1, x2, y2))
+                        scores.append(float(v))
 
                 with time_section(f"tm[{tidx}]:nms", single_perf):
                     keep = nms_rects(rects, scores, tm_iou)
@@ -603,18 +632,25 @@ else:
 
                 rects, scores = [], []
                 with time_section(f"tm[{tidx}]:collect_candidates", tmp_perf):
-                    if tm_method == cv2.TM_SQDIFF_NORMED:
-                        loc = np.where(res <= (1.0 - _tm["tm_thresh"]))
-                        for pt in zip(*loc[::-1]):
-                            x1, y1, x2, y2 = pt[0], pt[1], pt[0] + w, pt[1] + h
-                            rects.append((x1, y1, x2, y2))
-                            scores.append(1.0 - float(res[pt[1], pt[0]]))
-                    else:
-                        loc = np.where(res >= _tm["tm_thresh"]) 
-                        for pt in zip(*loc[::-1]):
-                            x1, y1, x2, y2 = pt[0], pt[1], pt[0] + w, pt[1] + h
-                            rects.append((x1, y1, x2, y2))
-                            scores.append(float(res[pt[1], pt[0]]))
+                    is_sqdiff = (tm_method == cv2.TM_SQDIFF_NORMED)
+                    res_for_max = (1.0 - res) if is_sqdiff else res
+                    thr = (1.0 - _tm["tm_thresh"]) if is_sqdiff else _tm["tm_thresh"]
+                    ks = 5
+                    kernel = np.ones((ks, ks), np.uint8)
+                    res_dil = cv2.dilate(res_for_max, kernel)
+                    peak_mask = (res_for_max >= (res_dil - 1e-12)) & (res_for_max >= thr)
+                    ys, xs = np.where(peak_mask)
+                    vals = res_for_max[ys, xs]
+                    K = 800
+                    if vals.size > K:
+                        kth = np.partition(vals, -K)[-K]
+                        sel = vals >= kth
+                        xs, ys, vals = xs[sel], ys[sel], vals[sel]
+                    rects, scores = [], []
+                    for x, y, v in zip(xs, ys, vals):
+                        x1, y1, x2, y2 = int(x), int(y), int(x + w), int(y + h)
+                        rects.append((x1, y1, x2, y2))
+                        scores.append(float(v))
 
                 with time_section(f"tm[{tidx}]:nms", tmp_perf):
                     keep = nms_rects(rects, scores, _tm["tm_iou"]) 
